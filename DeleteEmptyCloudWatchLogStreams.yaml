@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Daily job to delete empty CloudWatch LogStreams that are older than the LogGroups retention policy
+Metadata:
+  Source: https://github.com/gene1wood/delete-empty-cloudwatch-logstreams
+Resources:
+  DeleteEmptyLogStreamsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AllowLambdaLogging
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+        - PolicyName: AllowPutCloudWatchEventsRule
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:ListRules
+                  - events:PutTargets
+                Resource: '*'
+        - PolicyName: AllowCleanUpCloudWatchLogStreams
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:DeleteLogStream
+                Resource: '*'
+  DeleteEmptyLogStreamsFunctionInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref DeleteEmptyLogStreamsFunction
+      MaximumRetryAttempts: 0
+      Qualifier: $LATEST
+  DeleteEmptyLogStreamsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Daily job to delete empty CloudWatch LogStreams that are older than the LogGroups retention policy
+      Code:
+        # The code for this Lambda function needs to not exceed 4096 characters
+        # to work in-line in the CloudFormation template which is the reason for
+        # the long lines which aren't PEP008 compliant.
+        ZipFile: |
+          import logging, time, os, boto3, botocore.config
+          from datetime import datetime, timezone, timedelta
+
+          MILLIS_PER_DAY = 24 * 60 * 60 * 1000
+          config = botocore.config.Config(retries={'max_attempts': 10, 'mode': 'adaptive'})
+          logs_client = boto3.client('logs', config=config)
+
+          logger = logging.getLogger()
+          if len(logging.getLogger().handlers) == 0:
+              logger.addHandler(logging.StreamHandler())
+          fmt = "[%(levelname)s] %(asctime)s %(message)s"
+          logging.getLogger().handlers[0].setFormatter(logging.Formatter(fmt=fmt))
+          logging.getLogger('boto3').propagate = False
+          logging.getLogger('botocore').propagate = False
+          logging.getLogger('urllib3').propagate = False
+          logging.getLogger().setLevel(os.getenv('LOG_LEVEL', 'INFO'))
+
+
+          def delete_stream(log_group_name, log_stream, retention_millis):
+              last_event_milliseconds_ago = int(time.time() * 1000 - log_stream.get('lastEventTimestamp', log_stream.get('creationTime', 0)))
+              stream_name = log_stream['logStreamName']
+              if last_event_milliseconds_ago < retention_millis:
+                  return False
+              try:
+                  logs_client.delete_log_stream(logGroupName=log_group_name, logStreamName=stream_name)
+                  logger.info(f"Deleted logstream {log_group_name}/{stream_name} with last event {int(last_event_milliseconds_ago / MILLIS_PER_DAY)} days ago")
+              except:
+                  logger.debug(f"Logstream {log_group_name}/{stream_name} doesn't exist")
+              return True
+
+
+          def delete_streams(log_group_name, retention_millis):
+              stream_response_iterator = logs_client.get_paginator('describe_log_streams').paginate(logGroupName=log_group_name, orderBy='LogStreamName', descending=False)
+              for stream_response in stream_response_iterator:
+                  streams_deleted = False
+                  for log_stream in stream_response['logStreams']:
+                      if delete_stream(log_group_name, log_stream, retention_millis):
+                          streams_deleted = True
+                  if not streams_deleted:
+                      # The current page had no streams needing deletion, skip to the next log group
+                      break
+
+
+          def put_rule(next_run, function_arn):
+              rule_name = 'DeleteEmptyCloudWatchLogStreams'
+              client = boto3.client('events', config=config)
+              response = client.list_rules(NamePrefix=rule_name)
+              for rule in response['Rules']:
+                  existing_schedule = datetime.strptime(rule['ScheduleExpression'], 'cron(%M %H %d %m ? %Y)').replace(tzinfo=timezone.utc)
+                  if datetime.now(timezone.utc) < existing_schedule < next_run + timedelta(minutes=15):
+                      return False
+              schedule_expression = next_run.strftime('cron(%-M %-H %-d %-m ? %Y)')
+              logger.debug(f"Creating CloudWatch Event Rule to run at {next_run}")
+              client.put_rule(Name=rule_name, ScheduleExpression=schedule_expression, State='ENABLED', Description='Invoke DeleteEmptyCloudWatchLogStreams function')
+              client.put_targets(Rule=rule_name, Targets=[{'Id': f'{rule_name}Function', 'Arn': function_arn}])
+
+
+          def handler(event, context):
+              # Schedule this Lambda function to run again if it runs out of execution time
+              next_run = datetime.now(timezone.utc) + timedelta(milliseconds=context.get_remaining_time_in_millis()) + timedelta(minutes=1)
+              put_rule(next_run, context.invoked_function_arn)
+              group_response_iterator = logs_client.get_paginator('describe_log_groups').paginate()
+              for group_response in group_response_iterator:
+                  for log_group in group_response['logGroups']:
+                      if 'retentionInDays' not in log_group:
+                          logger.debug(f"Skipping log group {log_group['logGroupName']} as it has no retention setting")
+                          continue
+                      retention_millis = (log_group['retentionInDays'] + 1) * MILLIS_PER_DAY
+                      logger.info(f"Processing streams from log_group {log_group['logGroupName']} with retention {log_group['retentionInDays']} days")
+                      delete_streams(log_group['logGroupName'], retention_millis)
+
+              # Since this Lambda execution finished before running out of execution time change the rule to instead spawn next in 1 day
+              put_rule(datetime.now(timezone.utc) + timedelta(days=1), context.invoked_function_arn)
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      Handler: index.handler
+      Runtime: python3.7  # AWS Lambda doesn't support in-line code for python3.8
+      Role: !GetAtt DeleteEmptyLogStreamsFunctionRole.Arn
+      Tags:
+        - Key: application
+          Value: DeleteEmptyLogStreams
+        - Key: stack
+          Value: !Ref AWS::StackName
+        - Key: source
+          Value: https://github.com/gene1wood/delete-empty-cloudwatch-logstreams
+      Timeout: 900
+  DeleteEmptyLogStreamsFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join [ '/', ['/aws/lambda', !Ref 'DeleteEmptyLogStreamsFunction' ] ]
+      RetentionInDays: 30
+  DeleteEmptyLogStreamsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !GetAtt DeleteEmptyLogStreamsFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !Join [ '', [ 'arn:aws:events:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':rule/DeleteEmptyCloudWatchLogStreams' ] ]
