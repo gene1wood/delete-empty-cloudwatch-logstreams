@@ -100,17 +100,18 @@ Resources:
                       if delete_stream(log_group_name, log_stream, retention_millis):
                           streams_deleted = True
                   if not streams_deleted:
-                      # The current page had no streams needing deletion, skip to the next log group
+                      # No streams to delete in this page, skip to the next log group
                       break
 
 
-          def put_rule(next_run, function_arn):
+          def put_rule(delta, function_arn, force=False):
+              next_run = datetime.now(timezone.utc) + delta
               rule_name = 'DeleteEmptyCloudWatchLogStreams'
               client = boto3.client('events', config=config)
               response = client.list_rules(NamePrefix=rule_name)
               for rule in response['Rules']:
                   existing_schedule = datetime.strptime(rule['ScheduleExpression'], 'cron(%M %H %d %m ? %Y)').replace(tzinfo=timezone.utc)
-                  if datetime.now(timezone.utc) < existing_schedule < next_run + timedelta(minutes=15):
+                  if datetime.now(timezone.utc) < existing_schedule < next_run + timedelta(minutes=15) and not force:
                       return False
               schedule_expression = next_run.strftime('cron(%-M %-H %-d %-m ? %Y)')
               logger.debug(f"Creating CloudWatch Event Rule to run at {next_run}")
@@ -120,8 +121,8 @@ Resources:
 
           def handler(event, context):
               # Schedule this Lambda function to run again if it runs out of execution time
-              next_run = datetime.now(timezone.utc) + timedelta(milliseconds=context.get_remaining_time_in_millis()) + timedelta(minutes=1)
-              put_rule(next_run, context.invoked_function_arn)
+              delta = timedelta(milliseconds=context.get_remaining_time_in_millis()) + timedelta(minutes=1)
+              put_rule(delta, context.invoked_function_arn)
               group_response_iterator = logs_client.get_paginator('describe_log_groups').paginate()
               for group_response in group_response_iterator:
                   for log_group in group_response['logGroups']:
@@ -133,7 +134,7 @@ Resources:
                       delete_streams(log_group['logGroupName'], retention_millis)
 
               # Since this Lambda execution finished before running out of execution time change the rule to instead spawn next in 1 day
-              put_rule(datetime.now(timezone.utc) + timedelta(days=1), context.invoked_function_arn)
+              put_rule(timedelta(days=1), context.invoked_function_arn, True)
       Environment:
         Variables:
           LOG_LEVEL: INFO
