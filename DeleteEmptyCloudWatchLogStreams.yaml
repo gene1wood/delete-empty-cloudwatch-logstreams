@@ -139,7 +139,7 @@ Resources:
         Variables:
           LOG_LEVEL: INFO
       Handler: index.handler
-      Runtime: python3.7  # AWS Lambda doesn't support in-line code for python3.8
+      Runtime: python3.12
       Role: !GetAtt DeleteEmptyLogStreamsFunctionRole.Arn
       Tags:
         - Key: application
